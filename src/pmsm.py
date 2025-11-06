@@ -5,19 +5,20 @@ import os, math, ufl
 from mpi4py import MPI
 from petsc4py import PETSc
 import numpy as np
+import basix
 
-from ufl import (FiniteElement, VectorElement, MixedElement, 
-    TestFunction, TrialFunction, TestFunctions, TrialFunctions,
+from ufl import (TestFunction, TrialFunction, TestFunctions, TrialFunctions,
     SpatialCoordinate, grad, cross, curl, inner, system, 
     as_vector, FacetNormal, dot, sqrt, avg)
-from dolfinx import (DirichletBC, Function, FunctionSpace, log,
-    TimingType, list_timings)
+from dolfinx import (log)
+from basix.ufl import element
 from dolfinx.common import Timer
 from dolfinx.cpp.mesh import GhostMode
 from dolfinx.io import XDMFFile
-from dolfinx.fem import (assemble_matrix, assemble_vector,
-    assemble_scalar, apply_lifting, set_bc, locate_dofs_topological)
-
+from dolfinx.fem import (assemble_scalar, functionspace, dirichletbc, Function, 
+     set_bc, locate_dofs_topological, functionspace, form)
+from dolfinx.fem.petsc import (create_vector, 
+     assemble_vector, assemble_matrix, create_matrix, apply_lifting)
 t_run = Timer("00 Overall Run Time")
 
 # Log output options
@@ -33,29 +34,30 @@ log.set_output_file("output.txt")
 def SumFunctions(fncspace, name, A, B):
     fnc = Function(fncspace)
     fnc.name = name
-    fnc.vector.set(0.0)
-    fnc.vector.ghostUpdate(addv=PETSc.InsertMode.INSERT, 
-                           mode=PETSc.ScatterMode.FORWARD)
-    fnc.vector.axpy(1, A.vector)
-    fnc.vector.axpy(1, B.vector)
+    fnc.x.petsc_vec.set(0.0)
+    fnc.x.scatter_forward()
+    fnc.x.axpy(1, A.x)
+    fnc.x.axpy(1, B.x)
     return fnc
 
-def AssembleSystem(a, L, bcs, name):
-    if mesh.mpi_comm().rank == 0: 
+def AssembleSystem(a, v, bcs, name):
+    if mesh.comm.rank == 0: 
         log.log(loglevel, name + ": Assembling LHS Matrix")
     if not bcs:
-        A = assemble_matrix(a)
+        A = create_matrix(a)
+        A = assemble_matrix(A,a)
     else:
-        A = assemble_matrix(a, bcs)
+        A = create_matrix(a)
+        A = assemble_matrix(A,a,bcs)
     A.assemble()
 
-    if mesh.mpi_comm().rank == 0:
+    if mesh.comm.rank == 0:
         log.log(loglevel, name + ": Assembling RHS Vector")
-    b = assemble_vector(L)
-    apply_lifting(b, [a], [bcs])
-    b.ghostUpdate(addv=PETSc.InsertMode.ADD,
-                  mode=PETSc.ScatterMode.REVERSE)
-    set_bc(b, bcs)
+    b = create_vector(v)
+    b = assemble_vector(b,v)
+    apply_lifting(b, [v], [bcs])
+    b.scatter_forward()
+    for bc in bcs:  bc.set(b, x0=None, alpha=1.0)
     return A, b
 
 def OutputMesh(mesh, domains, facets, outname):
@@ -68,12 +70,12 @@ def OutputMesh(mesh, domains, facets, outname):
        file.write_meshtags(domains)
 
 def SaveSolution(fnc, t, file, name, units):
-    if mesh.mpi_comm().rank == 0:
+    if mesh.comm.rank == 0:
         log.log(loglevel, name + ": Saving Solution")
     file.write_function(fnc, round(t,3))
     
-    fncmax, fncmin = fnc.vector.max()[1], fnc.vector.min()[1]
-    if mesh.mpi_comm().rank == 0:
+    fncmax, fncmin = fnc.x.max()[1], fnc.x.min()[1]
+    if mesh.comm.rank == 0:
         log.log(loglevel, name + " Max: " + \
             str("{:.3e}".format(fncmax)) + " " + units)
         log.log(loglevel, name + " Min: " + \
@@ -161,7 +163,7 @@ t_01.stop()
 
 t_02 = Timer("02 Read Mesh")
 filedir = os.getcwd()
-meshpath = os.path.join(filedir, "models", meshname)
+meshpath = os.path.join(filedir, "src", "models", meshname)
 if MPI.COMM_WORLD.rank == 0: 
     log.log(loglevel, "Reading Mesh: " + meshpath)
 
@@ -172,7 +174,9 @@ with XDMFFile(MPI.COMM_WORLD,
     mesh = file.read_mesh(ghost_mode=GhostMode.none,
                           name="mesh",
                           xpath=r"/Xdmf/Domain")
-    mesh.topology.create_connectivity_all()
+    tdim = mesh.topology.dim
+    mesh.topology.create_connectivity(tdim, tdim - 1)
+    mesh.topology.create_connectivity(tdim - 1, 0)
     mt_facets  = file.read_meshtags(mesh, "facets")
     mt_domains = file.read_meshtags(mesh, "domains")
 
@@ -187,22 +191,26 @@ mshval = PmsmMeshValues(meshname)
 # OutputMesh(mesh, mt_domains, mt_facets, "mesh22")
 t_02.stop()
 
-
 ### Function Spaces ######################################################
 
 if MPI.COMM_WORLD.rank == 0: log.log(loglevel, "Creating Function Spaces")
-cell = mesh.ufl_cell()
 
-CG_V  = VectorElement("CG", cell, order_v)
-CG_F  = FiniteElement("CG", cell, order_s)
-DG_V  = VectorElement("DG", cell, 0)
+el_V  = basix.ufl.element("CG", mesh.basix_cell(), 2, shape=(mesh.geometry.dim,))
+el_F  = basix.ufl.element("CG", mesh.basix_cell(), 1)
+el_VF = basix.ufl.mixed_element([el_V, el_F])
 
-CG_VF = MixedElement([CG_V, CG_F])
+V_V    = functionspace(mesh, el_V)
+V_F    = functionspace(mesh, el_F)
+V_VF   = functionspace(mesh, el_VF)
+V_DGV  = functionspace(mesh, ("DG", 0)) 
 
-V_V    = FunctionSpace(mesh, CG_V)
-V_VF   = FunctionSpace(mesh, CG_VF)
-V_DGV  = FunctionSpace(mesh, DG_V) 
+### Print DOF Info #########################################################
+comm = MPI.COMM_WORLD
 
+if comm.rank == 0:
+    print("global dofs:", V_V.dofmap.index_map.size_global)
+else:
+    print("rank", comm.rank, "local dofs:", V_V.dofmap.index_map.size_local)
 
 ### UFL Functions ########################################################
 
@@ -220,7 +228,7 @@ z_unit  = as_vector((0,0,1))
 ###### A & V Equation Definition #########################################
 
 t_03 = Timer("03 Define Problem")
-if mesh.mpi_comm().rank == 0:
+if mesh.comm.rank == 0:
     log.log(loglevel, "AV: Defining Excitations")
 u_a, u_v = TrialFunctions(V_VF)
 v_a, v_v = TestFunctions(V_VF)
@@ -231,32 +239,26 @@ jsexp.amp = jsource_amp
 jsexp.omega = omega_f
 jsource = Function(V_V)
 jsource.interpolate(jsexp.eval)
-jsource.vector.ghostUpdate(addv=PETSc.InsertMode.INSERT,
-                           mode=PETSc.ScatterMode.FORWARD)
-
-view_jsource = PETSc.Viewer().createASCII("JSource.txt")
-view_jsource.view(jsource.vector)
+jsource.x.scatter_forward()
+view_jsource = PETSc.Viewer().createASCII("JSource.txt", mode=PETSc.Viewer.Mode.WRITE)
+view_jsource.view(jsource.x.petsc_vec)
 
 # Create magnetization excitation
 msexp = PMMagnetization()
 msexp.mag = msource_mag
 msource = Function(V_V)
 msource.interpolate(msexp.eval)
-msource.vector.ghostUpdate(addv=PETSc.InsertMode.INSERT,
-                           mode=PETSc.ScatterMode.FORWARD)
+msource.x.scatter_forward()
+view_msource = PETSc.Viewer().createASCII("MSource.txt", mode=PETSc.Viewer.Mode.WRITE)
+view_msource.view(msource.x.petsc_vec)
 
-view_msource = PETSc.Viewer().createASCII("MSource.txt")
-view_msource.view(msource.vector)
-
-if mesh.mpi_comm().rank == 0:
+if mesh.comm.rank == 0:
     log.log(loglevel, "AV: Defining Formulation")
 
 # Create initial A function
 A0 = Function(V_V)
-A0.vector.set(0.)
-A0.vector.ghostUpdate(addv=PETSc.InsertMode.INSERT,
-                      mode=PETSc.ScatterMode.FORWARD)
-
+A0.x.petsc_vec.set(0)
+A0.x.scatter_forward()
 # Domain labelling (dx)
 # 1| Outer Air Region        9| Coil 4 Region       17| Magnet 5 Region
 # 2| R/S Air Gap Region     10| Coil 5 Region       18| Magnet 6 Region
@@ -280,52 +282,84 @@ rot_mag_domain     = (dx(13) + dx(14) + dx(15) + dx(16) + \
                       dx(17) + dx(18) + dx(19) + dx(20) + \
                       dx(21) + dx(22))
 
-f_a = + inner((1/mu_stl)*grad(u_a),grad(v_a))*steel_domain \
-      + inner((1/mu_cop)*grad(u_a),grad(v_a))*coil_domain \
-      + inner((1/mu_mag)*grad(u_a),grad(v_a))*magnet_domain \
-      + inner((1/mu_air)*grad(u_a),grad(v_a))*air_domain \
-\
-      + (1/dt)*inner(sigma_stl*(u_a-A0),v_a)*steel_domain \
-      + (1/dt)*inner(sigma_cop*(u_a-A0),v_a)*coil_domain \
-      + (1/dt)*inner(sigma_mag*(u_a-A0),v_a)*magnet_domain \
-\
-      + inner(sigma_stl*grad(u_v),v_a)*steel_domain \
-      + inner(sigma_cop*grad(u_v),v_a)*coil_domain \
-      + inner(sigma_mag*grad(u_v),v_a)*magnet_domain \
-\
-      - inner(sigma_stl*cross(omega_v*radius,curl(u_a)),v_a)*rot_steel_domain \
-      - inner(sigma_mag*cross(omega_v*radius,curl(u_a)),v_a)*rot_mag_domain \
-\
-      - inner(jsource,v_a)*coil_domain \
-      - inner((mu_0/mu_mag)*msource,curl(v_a))*magnet_domain \
+# ---------- Build bilinear (a_av) and linear (L_av) parts ----------
+# Note: we split any terms containing known Functions (A0) into
+#       bilinear pieces (with trial functions) and linear source pieces.
 
-f_v = + inner(sigma_stl*grad(u_v),grad(v_v))*steel_domain \
-      + inner(sigma_cop*grad(u_v),grad(v_v))*coil_domain \
-      + inner(sigma_mag*grad(u_v),grad(v_v))*magnet_domain \
-      + inner(sigma_air*grad(u_v),grad(v_v))*air_domain \
-\
-      - (1/dt)*inner(sigma_stl*(u_a-A0),grad(v_v))*steel_domain \
-      - (1/dt)*inner(sigma_cop*(u_a-A0),grad(v_v))*coil_domain \
-      - (1/dt)*inner(sigma_mag*(u_a-A0),grad(v_v))*magnet_domain \
-\
-      + inner(sigma_stl*cross(omega_v*radius,curl(u_a)),grad(v_v))*rot_steel_domain \
-      + inner(sigma_mag*cross(omega_v*radius,curl(u_a)),grad(v_v))*rot_mag_domain \
+# Bilinear contributions (terms containing TrialFunctions: u_a or u_v)
+a_av = (
+    # stiffness-like terms for u_a
+    inner((1/mu_stl) * grad(u_a), grad(v_a)) * steel_domain
+    + inner((1/mu_cop) * grad(u_a), grad(v_a)) * coil_domain
+    + inner((1/mu_mag) * grad(u_a), grad(v_a)) * magnet_domain
+    + inner((1/mu_air) * grad(u_a), grad(v_a)) * air_domain
 
-form_av = f_a + f_v
-a_av, L_av = system(form_av)
+    # time-stepping mass-like pieces (only the part with u_a)
+    + (1/dt) * inner(sigma_stl * u_a, v_a) * steel_domain
+    + (1/dt) * inner(sigma_cop * u_a, v_a) * coil_domain
+    + (1/dt) * inner(sigma_mag * u_a, v_a) * magnet_domain
 
+    # coupling: grad(u_v) appears multiplied by v_a (trial u_v)
+    + inner(sigma_stl * grad(u_v), v_a) * steel_domain
+    + inner(sigma_cop * grad(u_v), v_a) * coil_domain
+    + inner(sigma_mag * grad(u_v), v_a) * magnet_domain
+
+    # rotation / velocity-coupling terms with trial u_a
+    - inner(sigma_stl * cross(omega_v * radius, curl(u_a)), v_a) * rot_steel_domain
+    - inner(sigma_mag * cross(omega_v * radius, curl(u_a)), v_a) * rot_mag_domain
+
+    # f_v block: bilinear terms containing u_v
+    + inner(sigma_stl * grad(u_v), grad(v_v)) * steel_domain
+    + inner(sigma_cop * grad(u_v), grad(v_v)) * coil_domain
+    + inner(sigma_mag * grad(u_v), grad(v_v)) * magnet_domain
+    + inner(sigma_air * grad(u_v), grad(v_v)) * air_domain
+
+    # coupling terms with trial u_a in f_v (split sign carefully)
+    - (1/dt) * inner(sigma_stl * u_a, grad(v_v)) * steel_domain
+    - (1/dt) * inner(sigma_cop * u_a, grad(v_v)) * coil_domain
+    - (1/dt) * inner(sigma_mag * u_a, grad(v_v)) * magnet_domain
+
+    # rotation terms that include trial u_a in f_v (note these are bilinear)
+    + inner(sigma_stl * cross(omega_v * radius, curl(u_a)), grad(v_v)) * rot_steel_domain
+    + inner(sigma_mag * cross(omega_v * radius, curl(u_a)), grad(v_v)) * rot_mag_domain
+)
+
+# Linear (RHS) contributions: all terms that contain only TestFunctions +/- known Functions
+L_av = (
+    # contributions from the A0 terms that we separated out:
+    - (1/dt) * inner(sigma_stl * A0, v_a) * steel_domain
+    - (1/dt) * inner(sigma_cop * A0, v_a) * coil_domain
+    - (1/dt) * inner(sigma_mag * A0, v_a) * magnet_domain
+
+    # contributions from the u_a-A0 terms in f_v (the part with +A0)
+    + (1/dt) * inner(sigma_stl * A0, grad(v_v)) * steel_domain
+    + (1/dt) * inner(sigma_cop * A0, grad(v_v)) * coil_domain
+    + (1/dt) * inner(sigma_mag * A0, grad(v_v)) * magnet_domain
+
+    # explicit source terms (these were already purely linear in f_a)
+    - inner(jsource, v_a) * coil_domain
+    - inner((mu_0 / mu_mag) * msource, curl(v_a)) * magnet_domain
+)
+jit_options = {"cffi_extra_compile_args": ["-Ofast", "-march=native"],
+               "cffi_libraries": ["m"]}
+
+form_a = form(a_av, jit_options=jit_options)   # bilinear
+form_L = form(L_av, jit_options=jit_options)   # linear
 
 ###### A & V Boundary Conditions #########################################
 
 # Apply boundary conditions
-if mesh.mpi_comm().rank == 0:
+if mesh.comm.rank == 0:
     log.log(loglevel, "AV: Applying Boundary Conditions")
 bcs_av = []
 
 u0 = Function(V_VF)
-u0.vector.set(0.)
-u0.vector.ghostUpdate(addv=PETSc.InsertMode.INSERT,
-                      mode=PETSc.ScatterMode.FORWARD)
+u0.x.petsc_vec.set(0.)
+u0.x.scatter_forward()
+
+# Make sure mesh connectivity exists
+
+mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
 
 x_faces = locate_dofs_topological(V_VF,
               mesh.topology.dim - 1,
@@ -340,12 +374,12 @@ z_faces = locate_dofs_topological(V_VF,
               mt_facets.indices[np.logical_or(mt_facets.values == 5,
                                               mt_facets.values == 6)]) 
                                               
-bcs_av.append( DirichletBC(u0.sub(0).sub(1), x_faces) )
-bcs_av.append( DirichletBC(u0.sub(0).sub(2), x_faces) )
-bcs_av.append( DirichletBC(u0.sub(0).sub(0), y_faces) )
-bcs_av.append( DirichletBC(u0.sub(0).sub(2), y_faces) )
-bcs_av.append( DirichletBC(u0.sub(0).sub(0), z_faces) )
-bcs_av.append( DirichletBC(u0.sub(0).sub(1), z_faces) )
+bcs_av.append( dirichletbc(u0.sub(0).sub(1), x_faces) )
+bcs_av.append( dirichletbc(u0.sub(0).sub(2), x_faces) )
+bcs_av.append( dirichletbc(u0.sub(0).sub(0), y_faces) )
+bcs_av.append( dirichletbc(u0.sub(0).sub(2), y_faces) )
+bcs_av.append( dirichletbc(u0.sub(0).sub(0), z_faces) )
+bcs_av.append( dirichletbc(u0.sub(0).sub(1), z_faces) )
 
 t_03.stop()
 
@@ -371,13 +405,15 @@ Js.name = "Js"
 ###### Initialise Solvers ################################################
 
 # A & V Solver
-A_av = assemble_matrix(a_av, bcs_av)
+A_mat = create_matrix(form_a)
+A_mat.zeroEntries()
+A_av = assemble_matrix(A_mat, form_a, bcs=bcs_av)
 A_av.assemble()
 AV = Function(V_VF)
 
 t_04 = Timer("04 Initialise Solvers")
 # Direct solver
-# solver_av = PETSc.KSP().create(mesh.mpi_comm())
+# solver_av = PETSc.KSP().create(mesh.comm)
 # solver_av.setOperators(A_av)
 # opts_av = PETSc.Options("AV_")
 # opts_av["ksp_type"] = "preonly"
@@ -387,7 +423,7 @@ t_04 = Timer("04 Initialise Solvers")
 # solver_av.setFromOptions()
 
 # Iterative solver
-solver_av = PETSc.KSP().create(mesh.mpi_comm())
+solver_av = PETSc.KSP().create(mesh.comm)
 solver_av.setOptionsPrefix("AV_")
 solver_av.setOperators(A_av)
 solver_av.setTolerances(rtol=1e-08, max_it=100000)
@@ -409,7 +445,7 @@ opts_av["ksp_view"] = None
 solver_av.setFromOptions()
 
 # Derived Quantity Solver
-solver_dq = PETSc.KSP().create(mesh.mpi_comm())
+solver_dq = PETSc.KSP().create(mesh.comm)
 solver_dq.setOptionsPrefix("DQ_")
 solver_dq.setType("preonly")
 solver_dq.getPC().setType("lu")
@@ -425,37 +461,38 @@ t_04.stop()
 
 ### Initialise Solution Files ############################################
 
-file_a = XDMFFile(mesh.mpi_comm(), "A.xdmf", "w")
+file_a = XDMFFile(mesh.comm, "A.xdmf", "w")
 file_a.write_mesh(mesh)
-file_v = XDMFFile(mesh.mpi_comm(), "V.xdmf", "w")
+
+file_v = XDMFFile(mesh.comm, "V.xdmf", "w")
 file_v.write_mesh(mesh)
 
-file_b = XDMFFile(mesh.mpi_comm(), "B.xdmf", "w")
+file_b = XDMFFile(mesh.comm, "B.xdmf", "w")
 file_b.write_mesh(mesh)
 
-file_je = XDMFFile(mesh.mpi_comm(), "Je.xdmf", "w")
+file_je = XDMFFile(mesh.comm, "Je.xdmf", "w")
 file_je.write_mesh(mesh)
 
-file_js = XDMFFile(mesh.mpi_comm(), "Js.xdmf", "w")
+file_js = XDMFFile(mesh.comm, "Js.xdmf", "w")
 file_js.write_mesh(mesh)
 
-file_jt = XDMFFile(mesh.mpi_comm(), "Jt.xdmf", "w")
+file_jt = XDMFFile(mesh.comm, "Jt.xdmf", "w")
 file_jt.write_mesh(mesh)
 
-
+print("Files Initialised")
 ### Time Loop ############################################################
 
 while not skiptimeloop:
 
-    if mesh.mpi_comm().rank == 0:
+    if mesh.comm.rank == 0:
         log.log(loglevel, "==================================================")
         log.log(loglevel, "Solving System at " + str(round(t,3)) + " seconds")
         log.log(loglevel, "==================================================")
 
-    jsemax, jsemin = jsource.vector.max()[1], jsource.vector.min()[1]
-    msemax, msemin = msource.vector.max()[1], msource.vector.min()[1]
+    jsemax, jsemin = jsource.x.petsc_vec.max()[1], jsource.x.petsc_vec.min()[1]
+    msemax, msemin = msource.x.petsc_vec.max()[1], msource.x.petsc_vec.min()[1]
 
-    if mesh.mpi_comm().rank == 0:
+    if mesh.comm.rank == 0:
         log.log(loglevel, "Js Expression Max: " + \
             str("{:.3e}".format(jsemax)) + " A/m^2")
         log.log(loglevel, "Js Expression Min: " + \
@@ -465,28 +502,32 @@ while not skiptimeloop:
         log.log(loglevel, "Ms Expression Min: " + \
             str("{:.3e}".format(msemin)) + " A/m^2")
 
-
+    print("Time Loop Solved")
 ###### A & V #############################################################
 
     t_05 = Timer("05 Assemble System")
-    A_av, b_av = AssembleSystem(a_av, L_av, bcs_av, "AV")
+    A_av, b_av = AssembleSystem(form_a, form_L, bcs_av, "AV")
     t_05.stop()
 
+    print("AV System Assembled")
+
     t_06 = Timer("06 Solve for A & V")
-    if mesh.mpi_comm().rank == 0:
+    if mesh.comm.rank == 0:
         log.log(loglevel, "AV: Solving")
-    solver_av.solve(b_av, AV.vector)
+    solver_av.solve(b_av, AV.x)
     solver_av.view()
     t_06.stop()
     
     t_07 = Timer("07 Save A & V Solution")
-    if mesh.mpi_comm().rank == 0:
+    if mesh.comm.rank == 0:
         log.log(loglevel, "AV: Saving Solution")
     A, V = AV.sub(0).collapse(), AV.sub(1).collapse()
     A.name, V.name = "A", "V"
+    print("AV Solved")
     SaveSolution(A, t, file_a, "A", "Tm")
     SaveSolution(V, t, file_v, "V", "V")
     t_07.stop()
+    print("AV Saved")
     
 
 ###### B #################################################################
@@ -503,10 +544,10 @@ while not skiptimeloop:
     A_b = assemble_matrix(a_b)
     A_b.assemble()
     
-    if mesh.mpi_comm().rank == 0:
+    if mesh.comm.rank == 0:
         log.log(loglevel, "B: Calculating")
     solver_dq.setOperators(A_b)
-    solver_dq.solve(b_b, B.vector)
+    solver_dq.solve(b_b, B.x)
     t_08.stop()
 
     t_09 = Timer("09 Save B Solution")
@@ -530,10 +571,10 @@ while not skiptimeloop:
 
     A_je, b_je = AssembleSystem(a_je, L_je, [], "Je")
 
-    if mesh.mpi_comm().rank == 0:
+    if mesh.comm.rank == 0:
         log.log(loglevel, "Je: Calculating")
     solver_dq.setOperators(A_je)
-    solver_dq.solve(b_je, Je.vector)
+    solver_dq.solve(b_je, Je.x)
     t_10.stop()
     
     t_11 = Timer("11 Save Je Solution")
@@ -552,10 +593,10 @@ while not skiptimeloop:
 
     A_js, b_js = AssembleSystem(a_js, L_js, [], "Js")
 
-    if mesh.mpi_comm().rank == 0:
+    if mesh.comm.rank == 0:
         log.log(loglevel, "Js: Calculating")
     solver_dq.setOperators(A_js)
-    solver_dq.solve(b_js, Js.vector)
+    solver_dq.solve(b_js, Js.x)
     t_12.stop()
     
     t_13 = Timer("13 Save Js Solution")
@@ -567,7 +608,7 @@ while not skiptimeloop:
     
     t_14 = Timer("14 Calculate Jt")
     
-    if mesh.mpi_comm().rank == 0:
+    if mesh.comm.rank == 0:
         log.log(loglevel, "Jt: Calculating")
     Jt = SumFunctions(V_DGV, "Jt", Je, Js)
     t_14.stop()
@@ -590,15 +631,15 @@ while not skiptimeloop:
     coil6 = assemble_scalar(dot(jsource,z_unit)*dS(mshval.coils[5]))
     
     coil_is = []
-    coil_is.append( mesh.mpi_comm().allreduce(coil1, op=MPI.SUM) )
-    coil_is.append( mesh.mpi_comm().allreduce(coil2, op=MPI.SUM) )
-    coil_is.append( mesh.mpi_comm().allreduce(coil3, op=MPI.SUM) )
-    coil_is.append( mesh.mpi_comm().allreduce(coil4, op=MPI.SUM) )
-    coil_is.append( mesh.mpi_comm().allreduce(coil5, op=MPI.SUM) )     
-    coil_is.append( mesh.mpi_comm().allreduce(coil6, op=MPI.SUM) )
+    coil_is.append( mesh.comm.allreduce(coil1, op=MPI.SUM) )
+    coil_is.append( mesh.comm.allreduce(coil2, op=MPI.SUM) )
+    coil_is.append( mesh.comm.allreduce(coil3, op=MPI.SUM) )
+    coil_is.append( mesh.comm.allreduce(coil4, op=MPI.SUM) )
+    coil_is.append( mesh.comm.allreduce(coil5, op=MPI.SUM) )     
+    coil_is.append( mesh.comm.allreduce(coil6, op=MPI.SUM) )
     t_16.stop()
     
-    if mesh.mpi_comm().rank == 0:
+    if mesh.comm.rank == 0:
         for i in range(len(coil_is)):
             log.log(loglevel, "Current in Coil " + \
                 str(i+1) + \
@@ -621,7 +662,7 @@ while not skiptimeloop:
     coil_pc.append( (1/sigma_cop)*coil_is[5]**2 )
     t_17.stop()
 
-    if mesh.mpi_comm().rank == 0:
+    if mesh.comm.rank == 0:
         for i in range(len(coil_pc)):
             log.log(loglevel, "Copper loss in Coil " + \
                 str(i+1) + \
@@ -637,10 +678,10 @@ while not skiptimeloop:
     # Eddy current losses
     eddy_loss = ((1/sigma_stl)*(Je**2))*steel_domain
     
-    Pe = mesh.mpi_comm().allreduce(assemble_scalar(eddy_loss), op=MPI.SUM)
+    Pe = mesh.comm.allreduce(assemble_scalar(eddy_loss), op=MPI.SUM)
     t_18.stop()
 
-    if mesh.mpi_comm().rank == 0:
+    if mesh.comm.rank == 0:
         log.log(loglevel, "Eddy current losses in steel domains " + \
             str("{:.3e}".format(Pe)) + " Watts")
 
@@ -649,7 +690,7 @@ while not skiptimeloop:
     
     t_19 = Timer("19 Calculate T")
     
-    if mesh.mpi_comm().rank == 0: log.log(loglevel, "T: Calculating")
+    if mesh.comm.rank == 0: log.log(loglevel, "T: Calculating")
 
     t_surfaces =   (dS(mshval.torqs[0]) \
                   + dS(mshval.torqs[1]) \
@@ -687,16 +728,16 @@ while not skiptimeloop:
     mst_fz  = b_3*t_surfaces
     mst_tz  = (cyl_r*b_2)*t_surfaces
     
-    Fx = mesh.mpi_comm().allreduce(assemble_scalar(mst_fx), op=MPI.SUM)
-    Fy = mesh.mpi_comm().allreduce(assemble_scalar(mst_fy), op=MPI.SUM)
-    Fr = mesh.mpi_comm().allreduce(assemble_scalar(mst_fr), op=MPI.SUM)
-    Ft = mesh.mpi_comm().allreduce(assemble_scalar(mst_ft), op=MPI.SUM)
-    Fz = mesh.mpi_comm().allreduce(assemble_scalar(mst_fz), op=MPI.SUM)
-    Tz = mesh.mpi_comm().allreduce(assemble_scalar(mst_tz), op=MPI.SUM)
+    Fx = mesh.comm.allreduce(assemble_scalar(mst_fx), op=MPI.SUM)
+    Fy = mesh.comm.allreduce(assemble_scalar(mst_fy), op=MPI.SUM)
+    Fr = mesh.comm.allreduce(assemble_scalar(mst_fr), op=MPI.SUM)
+    Ft = mesh.comm.allreduce(assemble_scalar(mst_ft), op=MPI.SUM)
+    Fz = mesh.comm.allreduce(assemble_scalar(mst_fz), op=MPI.SUM)
+    Tz = mesh.comm.allreduce(assemble_scalar(mst_tz), op=MPI.SUM)
     
     t_19.stop()
     
-    if mesh.mpi_comm().rank == 0:
+    if mesh.comm.rank == 0:
         log.log(loglevel, "Tz: " + str("{:.3e}".format(Tz)))
         log.log(loglevel, "Fx: " + str("{:.3e}".format(Fx)))
         log.log(loglevel, "Fy: " + str("{:.3e}".format(Fy)))
@@ -715,10 +756,8 @@ while not skiptimeloop:
     
     jsexp.t = t
     jsource.interpolate(jsexp.eval)
-    jsource.vector.ghostUpdate(addv=PETSc.InsertMode.INSERT,
-                               mode=PETSc.ScatterMode.FORWARD)
-    
-    A.vector.copy(result=A0.vector)
+    jsource.x.scatter_forward()    
+    A.x.copy(result=A0.x)
     
     t_20.stop()
 
@@ -733,10 +772,10 @@ file_je.close()
 file_js.close()
 file_jt.close()
 
-if mesh.mpi_comm().rank == 0:
+if mesh.comm.rank == 0:
     log.log(loglevel, "==================================================")
     log.log(loglevel, "Simulation Finished")
     log.log(loglevel, "==================================================")
 
 t_run.stop()
-list_timings(mesh.mpi_comm(), [TimingType.wall])
+Timer.list_timings(mesh.comm, [Timer.TimingType.wall])

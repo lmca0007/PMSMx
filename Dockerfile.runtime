@@ -1,0 +1,18 @@
+# Runtime image: HPC-friendly, non-interactive.
+FROM dolfinx/dolfinx:stable
+
+# Set working directory
+WORKDIR /home/fenics/app
+
+# Copy requirements only
+COPY requirements.txt ./
+
+# Install Python dependencies
+RUN python3 -m pip install --upgrade pip \
+    && python3 -m pip install --no-cache-dir -r requirements.txt
+
+# Copy repository files (needed for HPC batch runs)
+COPY . .
+
+# Default command: run solver
+CMD ["python3", "src/pmsm.py"]

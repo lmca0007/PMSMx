@@ -1,0 +1,6 @@
+meshio
+matplotlib
+pandas
+numpy
+scipy
+ipywidgets

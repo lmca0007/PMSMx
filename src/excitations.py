@@ -122,7 +122,7 @@ class PMMagnetization:
         self.sign = 1.
         self.mag = 1.
         self.m1, self.m2 = 0.727, 3.08
-        
+    
     def eval(self, coord):
         """PMSM Magnetization Excitation"""
         values = np.zeros((3, coord.shape[1]))
